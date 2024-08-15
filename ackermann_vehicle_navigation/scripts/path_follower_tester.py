@@ -158,7 +158,7 @@ def handle_vehicle_pose(msg, vehicle_name):
             cte = position*np.linalg.norm(np.cross(bc, -ba))/np.linalg.norm(bc)
     
             current_time = rospy.Time.now()
-            if seq is 0:
+            if seq == 0:
                 start_time = current_time
                 pre_time = rospy.Time.now() - rospy.Duration(0.001)
 

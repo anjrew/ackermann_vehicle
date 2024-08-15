@@ -51,6 +51,9 @@ limitations under the License.
   <include file="$(find ackermann_vehicle_description)/launch/ackermann_vehicle.launch">
     <arg name="namespace" value="$(arg namespace)"/>
   </include>
+  
+  <!-- Foxglove Bridge -->
+  <include file="$(find foxglove_bridge)/launch/foxglove_bridge.launch" />
 
   <group ns="$(arg namespace)">
     <!-- Create the world. -->
