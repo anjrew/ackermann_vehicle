@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 
 # Original Author: christoph.roesmann@tu-dortmund.de
-# aizzat : Update python3 path
 # if it does not work - please change to '#!/usr/bin/env python' in path on the header
 # This is to fix some compatibility issues with ROS on Melodic
 
@@ -9,7 +8,6 @@ import rospy, math
 from geometry_msgs.msg import Twist
 from ackermann_msgs.msg import AckermannDriveStamped
 from ackermann_msgs.msg import AckermannDrive
-
 
 def convert_trans_rot_vel_to_steering_angle(v, omega, wheelbase):
   if omega == 0 or v == 0:
