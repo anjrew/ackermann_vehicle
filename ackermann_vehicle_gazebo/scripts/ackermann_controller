@@ -113,6 +113,7 @@ limitations under the License.
 
 import math
 import numpy
+import numpy as np
 import threading
 
 from math import pi
@@ -124,41 +125,51 @@ from ackermann_msgs.msg import AckermannDrive
 from std_msgs.msg import Float64
 from controller_manager_msgs.srv import ListControllers
 
+from dataclasses import dataclass
+from typing import Optional, Tuple
 
-class _AckermannCtrlr(object):
+@dataclass
+class FrontWheelParams:
+    steer_link_name: str
+    steer_controller_name: str
+    axle_controller_name: Optional[str]
+    inv_circ: float
+
+@dataclass
+class RearWheelParams:
+    link_name: str
+    axle_controller_name: Optional[str]
+    inv_circ: float
+
+
+_DEF_WHEEL_DIA: float = 1.0    # Default wheel diameter. Unit: meter.
+_DEF_EQ_POS: float = 0.0       # Default equilibrium position. Unit: meter.
+_DEF_CMD_TIMEOUT: float = 0.5  # Default command timeout. Unit: second.
+_DEF_PUB_FREQ: float = 30.0    # Default publishing frequency. Unit: hertz.
+
+class _AckermannControllerNode(object):
     """Ackermann controller
 
-    An object of class _AckermannCtrlr is a node that controls the wheels of a
+    An object of class _AckermannController is a node that controls the wheels of a
     vehicle with Ackermann steering.
     """
 
     def __init__(self):
-        """Initialize this _AckermannCtrlr."""
+        """Initialize this _AckermannController."""
 
         rospy.init_node("ackermann_controller")
 
         # Parameters
 
         # Wheels
-        (left_steer_link_name, left_steer_ctrlr_name,
-         left_front_axle_ctrlr_name, self._left_front_inv_circ) = \
-                self._get_front_wheel_params("left")
+        left_front_params = self._get_front_wheel_params("left")
+        right_front_params = self._get_front_wheel_params("right")
+        left_rear_params = self._get_rear_wheel_params("left")
+        right_rear_params = self._get_rear_wheel_params("right")
 
-        (right_steer_link_name, right_steer_ctrlr_name,
-         right_front_axle_ctrlr_name, self._right_front_inv_circ) = \
-                self._get_front_wheel_params("right")
-
-        (left_rear_link_name, left_rear_axle_ctrlr_name,
-         self._left_rear_inv_circ) = \
-                self._get_rear_wheel_params("left")
-
-        (self._right_rear_link_name, right_rear_axle_ctrlr_name,
-         self._right_rear_inv_circ) = \
-                self._get_rear_wheel_params("right")
-
-        list_ctrlrs = rospy.ServiceProxy("controller_manager/list_controllers",
+        list_controllers = rospy.ServiceProxy("controller_manager/list_controllers",
                                          ListControllers)
-        list_ctrlrs.wait_for_service()
+        list_controllers.wait_for_service()
 
         # Shock absorbers
         shock_param_list = rospy.get_param("~shock_absorbers", [])
@@ -166,24 +177,24 @@ class _AckermannCtrlr(object):
         try:
             for shock_params in shock_param_list:
                 try:
-                    ctrlr_name = shock_params["controller_name"]
+                    controller_name = shock_params["controller_name"]
                     try:
                         eq_pos = shock_params["equilibrium_position"]
-                    except:
+                    except Exception:
                         eq_pos = self._DEF_EQ_POS
                     eq_pos = float(eq_pos)
-                except:
+                except Exception:
                     rospy.logwarn("An invalid parameter was specified for a "
                                   "shock absorber. The shock absorber will "
                                   "not be used.")
                     continue
 
-                pub = rospy.Publisher(ctrlr_name + "/command", Float64,
+                pub = rospy.Publisher(controller_name + "/command", Float64,
                                       latch=True, queue_size=1)
-                _wait_for_ctrlr(list_ctrlrs, ctrlr_name)
+                _wait_for_controller(list_controllers, controller_name)
                 pub.publish(eq_pos)
                 self._shock_pubs.append(pub)
-        except:
+        except Exception:
             rospy.logwarn("The specified list of shock absorbers is invalid. "
                           "No shock absorbers will be used.")
 
@@ -191,7 +202,7 @@ class _AckermannCtrlr(object):
         try:
             self._cmd_timeout = float(rospy.get_param("~cmd_timeout",
                                                       self._DEF_CMD_TIMEOUT))
-        except:
+        except Exception:
             rospy.logwarn("The specified command timeout value is invalid. "
                           "The default timeout value will be used instead.")
             self._cmd_timeout = self._DEF_CMD_TIMEOUT
@@ -202,7 +213,7 @@ class _AckermannCtrlr(object):
                                              self._DEF_PUB_FREQ))
             if pub_freq <= 0.0:
                 raise ValueError()
-        except:
+        except Exception:
             rospy.logwarn("The specified publishing frequency is invalid. "
                           "The default frequency will be used instead.")
             pub_freq = self._DEF_PUB_FREQ
@@ -215,10 +226,10 @@ class _AckermannCtrlr(object):
         # _ackermann_cmd_lock is used to control access to _steer_ang,
         # _steer_ang_vel, _speed, and _accel.
         self._ackermann_cmd_lock = threading.Lock()
-        self._steer_ang = 0.0      # Steering angle
-        self._steer_ang_vel = 0.0  # Steering angle velocity
+        self._steer_angle = 0.0      # Steering angle
+        self._steering_angle_velocity = 0.0  # Steering angle velocity
         self._speed = 0.0
-        self._accel = 0.0          # Acceleration
+        self._acceleration = 0.0          # Acceleration
 
         self._last_steer_ang = 0.0  # Last steering angle
         self._theta_left = 0.0      # Left steering joint angle
@@ -235,11 +246,11 @@ class _AckermannCtrlr(object):
         # _joint_dist_div_2 is the distance between the steering joints,
         # divided by two.
         tfl = tf.TransformListener()
-        ls_pos = self._get_link_pos(tfl, left_steer_link_name)
-        rs_pos = self._get_link_pos(tfl, right_steer_link_name)
+        ls_pos = self._get_link_pos(tfl, left_front_params.steer_link_name)
+        rs_pos = self._get_link_pos(tfl, right_front_params.steer_link_name)
         self._joint_dist_div_2 = numpy.linalg.norm(ls_pos - rs_pos) / 2
-        lrw_pos = self._get_link_pos(tfl, left_rear_link_name)
-        rrw_pos = numpy.array([0.0] * 3)
+        lrw_pos = self._get_link_pos(tfl, left_rear_params.link_name)
+        rrw_pos = numpy.array([0.0] * 3) # right rear wheel link is the origin
         front_cent_pos = (ls_pos + rs_pos) / 2     # Front center position
         rear_cent_pos = (lrw_pos + rrw_pos) / 2    # Rear center position
         self._wheelbase = numpy.linalg.norm(front_cent_pos - rear_cent_pos)
@@ -249,24 +260,25 @@ class _AckermannCtrlr(object):
         # Publishers and subscribers
 
         self._left_steer_cmd_pub = \
-            _create_cmd_pub(list_ctrlrs, left_steer_ctrlr_name)
+            _create_cmd_pub(list_controllers, left_front_params.controller_name)
         self._right_steer_cmd_pub = \
-            _create_cmd_pub(list_ctrlrs, right_steer_ctrlr_name)
+            _create_cmd_pub(list_controllers, right_front_params.controller_name)
 
         self._left_front_axle_cmd_pub = \
-            _create_axle_cmd_pub(list_ctrlrs, left_front_axle_ctrlr_name)
+            _create_axle_cmd_pub(list_controllers, left_front_params.axle_controller_name)
         self._right_front_axle_cmd_pub = \
-            _create_axle_cmd_pub(list_ctrlrs, right_front_axle_ctrlr_name)
+            _create_axle_cmd_pub(list_controllers, right_front_params.axle_controller_name)
         self._left_rear_axle_cmd_pub = \
-            _create_axle_cmd_pub(list_ctrlrs, left_rear_axle_ctrlr_name)
+            _create_axle_cmd_pub(list_controllers, left_rear_params.axle_controller_name)
         self._right_rear_axle_cmd_pub = \
-            _create_axle_cmd_pub(list_ctrlrs, right_rear_axle_ctrlr_name)
+            _create_axle_cmd_pub(list_controllers, right_rear_params.axle_controller_name)
 
         self._ackermann_cmd_sub = \
             rospy.Subscriber("ackermann_cmd", AckermannDrive,
                              self.ackermann_cmd_cb, queue_size=1)
 
-    def spin(self):
+
+    def spin(self) -> None:
         """Control the vehicle."""
 
         last_time = rospy.get_time()
@@ -285,10 +297,10 @@ class _AckermannCtrlr(object):
                 self._ctrl_axles(0.0, 0.0, 0.0, steer_ang_changed, center_y)
             elif delta_t > 0.0:
                 with self._ackermann_cmd_lock:
-                    steer_ang = self._steer_ang
-                    steer_ang_vel = self._steer_ang_vel
+                    steer_ang = self._steer_angle
+                    steer_ang_vel = self._steering_angle_velocity
                     speed = self._speed
-                    accel = self._accel
+                    accel = self._acceleration
                 steer_ang_changed, center_y = \
                     self._ctrl_steering(steer_ang, steer_ang_vel, delta_t)
                 self._ctrl_axles(speed, accel, delta_t, steer_ang_changed,
@@ -309,7 +321,7 @@ class _AckermannCtrlr(object):
 
             self._sleep_timer.sleep()
 
-    def ackermann_cmd_cb(self, ackermann_cmd):
+    def ackermann_cmd_cb(self, ackermann_cmd: AckermannDrive) -> None:
         """Ackermann driving command callback
 
         :Parameters:
@@ -318,12 +330,12 @@ class _AckermannCtrlr(object):
         """
         self._last_cmd_time = rospy.get_time()
         with self._ackermann_cmd_lock:
-            self._steer_ang = ackermann_cmd.steering_angle
-            self._steer_ang_vel = ackermann_cmd.steering_angle_velocity
+            self._steer_angle = ackermann_cmd.steering_angle
+            self._steering_angle_velocity = ackermann_cmd.steering_angle_velocity
             self._speed = ackermann_cmd.speed
-            self._accel = ackermann_cmd.acceleration
+            self._acceleration = ackermann_cmd.acceleration
 
-    def _get_front_wheel_params(self, side):
+    def _get_front_wheel_params(self, side: str) -> FrontWheelParams:
         # Get front wheel parameters. Return a tuple containing the steering
         # link name, steering controller name, axle controller name (or None),
         # and inverse of the circumference.
@@ -331,54 +343,65 @@ class _AckermannCtrlr(object):
         prefix = "~" + side + "_front_wheel/"
         steer_link_name = rospy.get_param(prefix + "steering_link_name",
                                           side + "_steering_link")
-        steer_ctrlr_name = rospy.get_param(prefix + "steering_controller_name",
+        steer_controller_name = rospy.get_param(prefix + "steering_controller_name",
                                            side + "_steering_controller")
-        axle_ctrlr_name, inv_circ = self._get_common_wheel_params(prefix)
-        return steer_link_name, steer_ctrlr_name, axle_ctrlr_name, inv_circ
+        axle_controller_name, inv_circ = self._get_common_wheel_params(prefix)
+        return FrontWheelParams(
+            steer_link_name=steer_link_name,
+            steer_controller_name=steer_controller_name,
+            axle_controller_name=axle_controller_name,
+            inv_circ=inv_circ
+        )
 
-    def _get_rear_wheel_params(self, side):
+    def _get_rear_wheel_params(self, side: str) -> RearWheelParams:
         # Get rear wheel parameters. Return a tuple containing the link name,
         # axle controller name, and inverse of the circumference.
 
         prefix = "~" + side + "_rear_wheel/"
         link_name = rospy.get_param(prefix + "link_name", side + "_wheel")
-        axle_ctrlr_name, inv_circ = self._get_common_wheel_params(prefix)
-        return link_name, axle_ctrlr_name, inv_circ
+        axle_controller_name, inv_circ = self._get_common_wheel_params(prefix)
+        return RearWheelParams(
+            link_name=link_name,
+            axle_controller_name=axle_controller_name,
+            inv_circ=inv_circ
+        )
 
-    def _get_common_wheel_params(self, prefix):
+    @staticmethod
+    def _get_common_wheel_params(prefix: str) -> Tuple[Optional[str], float]:
         # Get parameters used by the front and rear wheels. Return a tuple
         # containing the axle controller name (or None) and the inverse of the
         # circumference.
 
-        axle_ctrlr_name = rospy.get_param(prefix + "axle_controller_name",
+        axle_controller_name = rospy.get_param(prefix + "axle_controller_name",
                                           None)
 
         try:
             dia = float(rospy.get_param(prefix + "diameter",
-                                        self._DEF_WHEEL_DIA))
+                                        _DEF_WHEEL_DIA))
             if dia <= 0.0:
                 raise ValueError()
-        except:
+        except Exception:
             rospy.logwarn("The specified wheel diameter is invalid. "
                           "The default diameter will be used instead.")
-            dia = self._DEF_WHEEL_DIA
+            dia = _DEF_WHEEL_DIA
 
-        return axle_ctrlr_name, 1 / (pi * dia)
+        return axle_controller_name, 1 / (pi * dia)
 
-    def _get_link_pos(self, tfl, link):
+    def _get_link_pos(self, tfl: tf.TransformListener, link: str) -> np.ndarray:
         # Return the position of the specified link, relative to the right
         # rear wheel link.
 
         while True:
             try:
-                trans, not_used = \
+                trans, _ = \
                     tfl.lookupTransform(self._right_rear_link_name, link,
                                         rospy.Time(0))
                 return numpy.array(trans)
-            except:
+            except Exception:
                 pass
 
-    def _ctrl_steering(self, steer_ang, steer_ang_vel_limit, delta_t):
+    def _ctrl_steering(self, steer_ang: float, steer_ang_vel_limit: float, delta_t: float) -> Tuple[bool, float]:
+
         # Control the steering joints.
 
         # Compute theta, the virtual front wheel's desired steering angle.
@@ -444,35 +467,35 @@ class _AckermannCtrlr(object):
     _DEF_EQ_POS = 0.0       # Default equilibrium position. Unit: meter.
     _DEF_CMD_TIMEOUT = 0.5  # Default command timeout. Unit: second.
     _DEF_PUB_FREQ = 30.0    # Default publishing frequency. Unit: hertz.
-# end _AckermannCtrlr
+# end _AckermannController
 
 
-def _wait_for_ctrlr(list_ctrlrs, ctrlr_name):
+def _wait_for_controller(list_controllers, controller_name):
     # Wait for the specified controller to be in the "running" state.
     # Commands can be lost if they are published before their controller is
     # running, even if a latched publisher is used.
 
     while True:
-        response = list_ctrlrs()
-        for ctrlr in response.controller:
-            if ctrlr.name == ctrlr_name:
-                if ctrlr.state == "running":
+        response = list_controllers()
+        for controller in response.controller:
+            if controller.name == controller_name:
+                if controller.state == "running":
                     return
                 rospy.sleep(0.1)
                 break
 
 
-def _create_axle_cmd_pub(list_ctrlrs, axle_ctrlr_name):
+def _create_axle_cmd_pub(list_controllers, axle_controller_name):
     # Create an axle command publisher.
-    if not axle_ctrlr_name:
+    if not axle_controller_name:
         return None
-    return _create_cmd_pub(list_ctrlrs, axle_ctrlr_name)
+    return _create_cmd_pub(list_controllers, axle_controller_name)
 
 
-def _create_cmd_pub(list_ctrlrs, ctrlr_name):
+def _create_cmd_pub(list_controllers, controller_name):
     # Create a command publisher.
-    _wait_for_ctrlr(list_ctrlrs, ctrlr_name)
-    return rospy.Publisher(ctrlr_name + "/command", Float64, queue_size=1)
+    _wait_for_controller(list_controllers, controller_name)
+    return rospy.Publisher(controller_name + "/command", Float64, queue_size=1)
 
 
 def _get_steer_ang(phi):
@@ -484,5 +507,5 @@ def _get_steer_ang(phi):
 
 # main
 if __name__ == "__main__":
-    ctrlr = _AckermannCtrlr()
-    ctrlr.spin()
+    controller = _AckermannControllerNode()
+    controller.spin()
