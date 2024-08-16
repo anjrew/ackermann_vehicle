@@ -60,7 +60,7 @@ catkin_make
 ## Running
 
 ```bash
-`roslaunch ackermann_vehicle_gazebo ackermann_vehicle_noetic.launch`
+roslaunch ackermann_vehicle_gazebo ackermann_vehicle_noetic.launch
 ```
 
 ## To test the steering command:
